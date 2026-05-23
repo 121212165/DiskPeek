@@ -1,4 +1,4 @@
-name: CI/CD
+name: CI
 
 on:
   push:
@@ -6,57 +6,104 @@ on:
   pull_request:
     branches: [master]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
+  # ─── 前端构建 & 检查 ──────────────────────────────────
   frontend:
-    name: Frontend (Svelte + Vite)
+    name: Frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
+          cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
 
-      - name: Build
-        run: npm run build
+      - run: npm run build
 
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  # ─── Rust 代码质量 ────────────────────────────────────
   backend:
-    name: Backend (Rust + Tauri)
+    name: Rust
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
 
-      - name: Install system dependencies (Tauri)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: tauri
+
+      - name: Install Tauri system deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Cargo check
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+      - name: Format check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
-      - name: Cargo clippy
+      - name: Clippy (strict)
         run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 
-      - name: Cargo test
+      - name: Test
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Build check (release)
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release
+
+  # ─── 安全审计 ─────────────────────────────────────────
   security:
-    name: Security Audit
+    name: Security
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
-      - name: Audit Rust dependencies
-        uses: actions-rs/audit-check@v1
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: tauri
+
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─── 全量通过标记 ────────────────────────────────────
+  ok:
+    name: All Green
+    needs: [frontend, backend, security]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ needs.frontend.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.backend.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.security.result }}" != "success" ]]; then exit 1; fi
+          echo "All checks passed"
