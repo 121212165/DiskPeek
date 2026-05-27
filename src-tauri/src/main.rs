@@ -4,12 +4,24 @@ mod cache;
 mod scanner;
 
 use cache::{cache_exists, get_cache_path, load_cache, save_cache, ScanCache};
-use scanner::{get_default_scan_roots, scan_directory, FileNode};
+use scanner::{get_default_scan_roots, scan_directory, FileNode, ScanEvent};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
+
+// ============================================================
+// 全局取消标志
+// ============================================================
+
+static CANCEL_FLAG: OnceLock<AtomicBool> = OnceLock::new();
+
+fn get_cancel_flag() -> &'static AtomicBool {
+    CANCEL_FLAG.get_or_init(|| AtomicBool::new(false))
+}
 
 // ============================================================
 // 事件负载结构体（发送给前端）
@@ -53,6 +65,9 @@ struct CheckCacheResult {
 /// 后续可扩展 extended 增加 C 盘根、full 增加所有盘符。
 #[tauri::command(rename = "scan")]
 fn scan_command(app_handle: tauri::AppHandle, mode: String) {
+    // 重置取消标志
+    get_cancel_flag().store(false, Ordering::Relaxed);
+
     // 根据模式确定扫描根目录列表
     let roots = match mode.as_str() {
         "default" => get_default_scan_roots(),
@@ -76,8 +91,15 @@ fn scan_command(app_handle: tauri::AppHandle, mode: String) {
         let mut total_size: u64 = 0;
         // 收集所有根节点（用于缓存）
         let mut root_nodes: Vec<FileNode> = Vec::new();
+        let mut cancelled = false;
 
         for root in &roots {
+            // 检查取消标志
+            if get_cancel_flag().load(Ordering::Relaxed) {
+                cancelled = true;
+                break;
+            }
+
             let (tx, rx) = mpsc::channel::<ScanEvent>();
 
             let root_clone = root.clone();
@@ -85,11 +107,17 @@ fn scan_command(app_handle: tauri::AppHandle, mode: String) {
 
             // 在子线程中扫描当前根目录
             let scan_thread = thread::spawn(move || {
-                scan_directory(root_clone, tx);
+                scan_directory(&root_clone, &tx);
             });
 
             // 主线程消费扫描事件，通过 Tauri 事件推送到前端
             for event in rx {
+                // 检查取消标志
+                if get_cancel_flag().load(Ordering::Relaxed) {
+                    cancelled = true;
+                    break;
+                }
+
                 // 统计文件数和大小
                 count_files_and_size(&event.nodes, &mut total_file_count, &mut total_size);
 
@@ -109,9 +137,20 @@ fn scan_command(app_handle: tauri::AppHandle, mode: String) {
 
             // 等待扫描线程结束
             let _ = scan_thread.join();
+
+            if cancelled {
+                break;
+            }
         }
 
-        // 扫描完成：写入缓存
+        // 如果被取消，重置标志并通知前端
+        if cancelled {
+            get_cancel_flag().store(false, Ordering::Relaxed);
+            let _ = app_handle.emit("scan_cancelled", ());
+            return;
+        }
+
+        // 扫描完成：异步写入缓存
         let cache = ScanCache {
             scan_time,
             scan_mode: mode.clone(),
@@ -119,15 +158,24 @@ fn scan_command(app_handle: tauri::AppHandle, mode: String) {
             total_file_count,
             total_size,
         };
-        save_cache(&cache);
+        let cache_clone = cache.clone();
+        thread::spawn(move || {
+            save_cache(&cache_clone);
+        });
 
-        // 向 Tauri 注册 scan_path 变量，供前端获取缓存路径
+        // 向前端发送扫描完成事件
         let _ = app_handle.emit("scan_complete", ScanCompletePayload {
             total_file_count,
             total_size,
             scan_time,
         });
     });
+}
+
+/// 取消正在进行的扫描任务。
+#[tauri::command]
+fn cancel_scan() {
+    get_cancel_flag().store(true, Ordering::Relaxed);
 }
 
 /// 检查缓存是否存在，返回存在标志与上次扫描时间。
@@ -209,6 +257,7 @@ fn main() {
             check_cache_command,
             load_cache_command,
             open_in_explorer_command,
+            cancel_scan,
         ])
         .run(tauri::generate_context!())
         .expect("DiskPeek 启动失败");

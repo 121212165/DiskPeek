@@ -5,6 +5,7 @@
   export let viewMode: ViewMode;
   export let onScan: () => void;
   export let onSwitchView: (mode: ViewMode) => void;
+  export let onCancel: () => void = () => {};
 
   function scanLabel(): string {
     switch (scanState) {
@@ -27,9 +28,14 @@
 <header class="toolbar">
   <span class="brand">DiskPeek</span>
 
-  <button class="scan-btn" on:click={onScan} disabled={scanState === 'scanning'}>
-    {scanLabel()}
-  </button>
+  <div class="scan-area">
+    {#if scanState === 'scanning'}
+      <button class="scan-btn scanning" disabled>扫描中...</button>
+      <button class="cancel-btn" on:click={onCancel} title="取消扫描">✕</button>
+    {:else}
+      <button class="scan-btn" on:click={onScan}>{scanLabel()}</button>
+    {/if}
+  </div>
 
   <div class="view-switcher">
     {#each views as v}
@@ -52,7 +58,7 @@
     justify-content: space-between;
     height: 48px;
     padding: 0 16px;
-    background: #1e1e2e;
+    background: var(--bg-toolbar, #1e1e2e);
     color: #fff;
     flex-shrink: 0;
   }
@@ -63,11 +69,17 @@
     letter-spacing: 0.5px;
   }
 
+  .scan-area {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
   .scan-btn {
     padding: 6px 20px;
     border: none;
     border-radius: 8px;
-    background: #7c3aed;
+    background: var(--accent, #7c3aed);
     color: #fff;
     font-size: 14px;
     font-weight: 600;
@@ -76,12 +88,36 @@
   }
 
   .scan-btn:hover:not(:disabled) {
-    background: #6d28d9;
+    background: var(--accent-hover, #6d28d9);
   }
 
   .scan-btn:disabled {
     opacity: 0.6;
     cursor: not-allowed;
+  }
+
+  .scan-btn.scanning {
+    opacity: 0.7;
+    cursor: wait;
+  }
+
+  .cancel-btn {
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 6px;
+    background: rgba(255, 80, 80, 0.2);
+    color: #ff6b6b;
+    font-size: 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s;
+  }
+
+  .cancel-btn:hover {
+    background: rgba(255, 80, 80, 0.4);
   }
 
   .view-switcher {
@@ -109,7 +145,7 @@
   }
 
   .view-btn.active {
-    background: #7c3aed;
+    background: var(--accent, #7c3aed);
     color: #fff;
   }
 </style>

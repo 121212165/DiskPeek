@@ -39,42 +39,45 @@
     depth: number;
   }
 
+  function sumDirectorySize(node: FileNode): number {
+    if (!node.isDirectory) return node.size;
+    return node.children.reduce((sum, child) => sum + sumDirectorySize(child), 0);
+  }
+
   function flattenAndSort(
     nodes: FileNode[],
-    depth: number,
-    result: FlatRow[],
-    totalRef: { value: number }
-  ): void {
-    const sorted = [...nodes].sort((a, b) => {
-      if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+    depth: number
+  ): { rows: FlatRow[]; total: number } {
+    const result: FlatRow[] = [];
+    let total = 0;
+    const stack: { items: FileNode[]; depth: number }[] = [{ items: nodes, depth }];
 
-      let cmp = 0;
-      if (sortKey === 'name') {
-        cmp = a.name.localeCompare(b.name);
-      } else {
-        cmp = a.size - b.size;
-      }
-      return sortDirection === 'asc' ? cmp : -cmp;
-    });
-
-    for (const node of sorted) {
-      result.push({ node, depth });
-      totalRef.value += node.size;
-      if (node.isDirectory && node.children.length > 0 && expandedIds.has(node.id)) {
-        flattenAndSort(node.children, depth + 1, result, totalRef);
+    while (stack.length > 0) {
+      const { items, depth: d } = stack.pop()!;
+      const sorted = [...items].sort((a, b) => {
+        if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+        let cmp = sortKey === 'name' ? a.name.localeCompare(b.name) : a.size - b.size;
+        return sortDirection === 'asc' ? cmp : -cmp;
+      });
+      for (let i = sorted.length - 1; i >= 0; i--) {
+        const node = sorted[i];
+        result.push({ node, depth: d });
+        total += node.size;
+        if (node.isDirectory && node.children.length > 0 && expandedIds.has(node.id)) {
+          stack.push({ items: node.children, depth: d + 1 });
+        }
       }
     }
+    return { rows: result, total };
   }
 
   let grandTotal = 0;
   let flatRows: FlatRow[] = [];
 
   $: {
-    const rows: FlatRow[] = [];
-    const totalRef = { value: 0 };
-    flattenAndSort(rootNodes, 0, rows, totalRef);
+    const { rows, total } = flattenAndSort(rootNodes, 0);
     flatRows = rows;
-    grandTotal = totalRef.value;
+    grandTotal = total;
   }
 
   // --- Handlers ---
@@ -160,7 +163,7 @@
           </span>
 
           <!-- Size -->
-          <span class="size-cell">{row.node.isDirectory ? '-' : formatSize(row.node.size)}</span>
+          <span class="size-cell">{row.node.isDirectory ? formatSize(sumDirectorySize(row.node)) : formatSize(row.node.size)}</span>
 
           <!-- Time -->
           <span class="time-cell">{formatTime(row.node.modifiedAt)}</span>
@@ -184,7 +187,7 @@
 
 <style>
   .list-container {
-    background: #fff;
+    background: var(--bg-card, #fff);
     margin: 12px 16px 40px 16px;
     border-radius: 12px;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
@@ -207,9 +210,9 @@
     padding: 0 12px;
     font-size: 13px;
     font-weight: 600;
-    color: #666;
-    background: #fafafa;
-    border-bottom: 1px solid #eee;
+    color: var(--text-secondary, #666);
+    background: var(--bg-toolbar-secondary, #fafafa);
+    border-bottom: 1px solid var(--border, #eee);
   }
 
   .col-name {
@@ -255,7 +258,7 @@
   }
 
   .row:hover {
-    background: #f5f3ff;
+    background: var(--bg-hover, #f5f3ff);
   }
 
   .row.dir {
@@ -355,8 +358,8 @@
     gap: 8px;
     padding: 16px;
     font-size: 13px;
-    color: #7c3aed;
-    background: #fafafa;
+    color: var(--accent, #7c3aed);
+    background: var(--bg-toolbar-secondary, #fafafa);
   }
 
   .loader-dot {

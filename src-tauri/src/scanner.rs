@@ -1,10 +1,10 @@
 //! 文件扫描引擎 — 遍历目录树，构建 FileNode 并按目录粒度增量推送扫描事件。
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc::Sender;
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 // ============================================================
@@ -14,7 +14,7 @@ use walkdir::WalkDir;
 /// 文件树节点：代表一个文件或目录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileNode {
-    /// 基于路径 SHA256 前 16 位 hex 生成的唯一标识
+    /// 基于路径 UUID v5 生成的唯一标识
     pub id: String,
     /// 文件或目录名
     pub name: String,
@@ -27,7 +27,7 @@ pub struct FileNode {
     pub size: u64,
     /// 扩展名（小写，不含点号），目录为空串
     pub extension: String,
-    /// 文件类型分类：VIDEO | IMAGE | DOCUMENT | ARCHIVE | OTHER；目录为 None
+    /// 文件类型分类：VIDEO | IMAGE | AUDIO | DOCUMENT | ARCHIVE | OTHER；目录为 None
     #[serde(rename = "fileType")]
     pub file_type: Option<String>,
     /// 创建时间（Unix 秒级时间戳）
@@ -63,12 +63,10 @@ pub struct ScanEvent {
 // 公开 API
 // ============================================================
 
-/// 返回默认扫描根目录列表：
-/// Desktop、Documents、Downloads、Pictures、Videos、Music，以及 AppData（排除 Local/Temp 下的缓存）。
+/// 返回默认扫描根目录列表。
 pub fn get_default_scan_roots() -> Vec<String> {
     let mut roots = Vec::new();
 
-    // 逐个收集常用用户目录
     if let Some(p) = dirs::desktop_dir() {
         roots.push(p.to_string_lossy().to_string());
     }
@@ -87,8 +85,6 @@ pub fn get_default_scan_roots() -> Vec<String> {
     if let Some(p) = dirs::audio_dir() {
         roots.push(p.to_string_lossy().to_string());
     }
-
-    // AppData（Roaming），排除 Local/Temp 下的缓存
     if let Some(p) = dirs::data_dir() {
         roots.push(p.to_string_lossy().to_string());
     }
@@ -96,92 +92,89 @@ pub fn get_default_scan_roots() -> Vec<String> {
     roots
 }
 
-/// 扫描指定根目录，每完成一个目录的扫描即通过 tx 发送 ScanEvent。
+/// 扫描指定根目录，使用栈驱动的单次遍历算法。
 ///
-/// - 跳过 junction / 符号链接（follow_links = false 且检测 symlink）
-/// - 跳过已知缓存目录（node_modules、.git、__pycache__、target 等）
-/// - 权限不足时静默跳过，并在对应节点标记 permission_denied
-pub fn scan_directory(root_path: String, tx: Sender<ScanEvent>) {
-    // 使用 walkdir 遍历，follow_links(false) 避免进入 junction
-    let walker = WalkDir::new(&root_path)
+/// - 消除了 `collect_children` 的冗余 `fs::read_dir` 调用
+/// - 复用 WalkDir 已缓存的 metadata
+/// - 跳过符号链接和已知缓存目录
+/// - 权限不足时标记 permission_denied
+pub fn scan_directory(root_path: &str, tx: &Sender<ScanEvent>) {
+    let walker = WalkDir::new(root_path)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter();
 
-    // 对每个目录：读取其直接子项，构建 FileNode 列表，发送 ScanEvent
-    // - 跳过符号链接和缓存目录
-    // - walkdir 会按深度优先遍历，每个目录（含根目录）都会被作为 entry 访问一次
+    // 栈: (目录路径, 目录节点, 收集的子节点列表, 深度)
+    let mut stack: Vec<(std::path::PathBuf, FileNode, Vec<FileNode>, usize)> = Vec::new();
 
     for entry in walker {
-        match entry {
-            Ok(e) => {
-                let path = e.path();
-
-                // 跳过符号链接 / junction
-                if e.file_type().is_symlink() {
-                    continue;
-                }
-
-                // 仅处理目录：读取其直接子项并发送事件
-                if e.file_type().is_dir() {
-                    let dir_name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_lowercase())
-                        .unwrap_or_default();
-
-                    // 跳过已知缓存目录
-                    if is_cache_dir(&dir_name) {
-                        continue;
-                    }
-
-                    // 收集该目录的直接子项
-                    let children = match collect_children(path) {
-                        Ok(c) => c,
-                        Err(_) => {
-                            // 权限不足：发送一个标记 permission_denied 的空事件
-                            let mut denied_node = build_file_node(path, None);
-                            denied_node.permission_denied = true;
-                            let _ = tx.send(ScanEvent {
-                                root_path: root_path.clone(),
-                                nodes: vec![denied_node],
-                            });
-                            continue;
-                        }
-                    };
-
-                    let parent_id = generate_id(&e.path().to_string_lossy());
-                    // 构建当前目录节点，附带子项
-                    let mut dir_node = build_file_node(path, None);
-                    dir_node.children = children
-                        .into_iter()
-                        .map(|child_path| {
-                            let mut node = build_file_node(&child_path, Some(parent_id.clone()));
-                            // 如果子项也是目录，递归时 children 留空（由后续 entry 单独发送）
-                            if child_path.is_dir() {
-                                node.children = Vec::new();
-                            }
-                            node
-                        })
-                        .collect();
-
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                if let Some(p) = err.path() {
+                    let mut node = build_file_node(p, None, None);
+                    node.permission_denied = true;
                     let _ = tx.send(ScanEvent {
-                        root_path: root_path.clone(),
-                        nodes: vec![dir_node],
+                        root_path: root_path.to_string(),
+                        nodes: vec![node],
                     });
                 }
+                continue;
             }
-            Err(_err) => {
-                // walkdir 内部权限不足等错误：静默跳过
-                // 通过 io::Error 提取路径并发送 permission_denied 事件
-                if let Some(denied_path) = _err.path() {
-                    let mut denied_node = build_file_node(denied_path, None);
-                    denied_node.permission_denied = true;
-                    let _ = tx.send(ScanEvent {
-                        root_path: root_path.clone(),
-                        nodes: vec![denied_node],
-                    });
-                }
+        };
+
+        let path = entry.path();
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+
+        let depth = entry.depth();
+        let is_dir = entry.file_type().is_dir();
+
+        // 深度下降 = 外层目录扫描完成，弹出栈并发送事件
+        while stack.last().map_or(false, |(_, _, _, d)| *d >= depth) {
+            let (_dir_path, mut dir_node, children, _) = stack.pop().unwrap();
+            dir_node.children = children;
+            let _ = tx.send(ScanEvent {
+                root_path: root_path.to_string(),
+                nodes: vec![dir_node.clone()],
+            });
+            // 将完成的目录节点追加到新栈顶的 children
+            if let Some(top) = stack.last_mut() {
+                top.2.push(dir_node);
             }
+        }
+
+        if is_dir {
+            let dir_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if is_cache_dir(&dir_name) {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            let dir_node = build_file_node(path, None, meta.as_ref());
+            stack.push((path.to_path_buf(), dir_node, Vec::new(), depth));
+        } else {
+            let parent_id = stack.last().map(|(_, node, _, _)| node.id.clone());
+            let meta = entry.metadata().ok();
+            let file_node = build_file_node(path, parent_id, meta.as_ref());
+            if let Some(top) = stack.last_mut() {
+                top.2.push(file_node);
+            }
+        }
+    }
+
+    // 遍历结束后，弹出所有剩余栈条目
+    while let Some((_dir_path, mut dir_node, children, _)) = stack.pop() {
+        dir_node.children = children;
+        let _ = tx.send(ScanEvent {
+            root_path: root_path.to_string(),
+            nodes: vec![dir_node.clone()],
+        });
+        if let Some(top) = stack.last_mut() {
+            top.2.push(dir_node);
         }
     }
 }
@@ -190,8 +183,15 @@ pub fn scan_directory(root_path: String, tx: Sender<ScanEvent>) {
 // 内部辅助函数
 // ============================================================
 
+/// UUID v5 命名空间常量
+const DISKPEEK_NS: Uuid = Uuid::NAMESPACE_URL;
+
+/// 基于路径的 UUID v5 生成唯一 id。
+fn generate_id(path_str: &str) -> String {
+    Uuid::new_v5(&DISKPEEK_NS, path_str.as_bytes()).to_string()
+}
+
 /// 根据扩展名分类文件类型。
-/// 返回 Option<String>：VIDEO | IMAGE | DOCUMENT | ARCHIVE | OTHER；扩展名为空返回 None。
 pub fn classify_file_type(ext: &str) -> Option<String> {
     if ext.is_empty() {
         return None;
@@ -199,20 +199,16 @@ pub fn classify_file_type(ext: &str) -> Option<String> {
 
     let ext_lower = ext.to_lowercase();
     let category = match ext_lower.as_str() {
-        // 视频
         "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg"
         | "3gp" | "rmvb" | "ts" => "VIDEO",
-        // 图片
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tiff" | "tif"
-        | "heic" | "raw" | "cr2" | "nef" => "IMAGE",
-        // 文档
+        | "heic" | "raw" | "cr2" | "nef" | "psd" => "IMAGE",
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "wma" | "m4a" | "opus" => "AUDIO",
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv"
         | "json" | "xml" | "html" | "htm" | "rtf" | "odt" | "ods" | "odp" | "epub" | "mobi"
         | "log" | "yaml" | "yml" | "toml" | "ini" | "cfg" => "DOCUMENT",
-        // 压缩包
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "lz" | "lz4" | "zst" | "iso"
-        | "cab" | "arj" => "ARCHIVE",
-        // 其他
+        | "cab" | "arj" | "apk" | "dmg" => "ARCHIVE",
         _ => "OTHER",
     };
 
@@ -241,16 +237,9 @@ fn is_cache_dir(dir_name: &str) -> bool {
     )
 }
 
-/// 基于路径的 SHA256 前 16 位 hex 生成唯一 id。
-fn generate_id(path_str: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(path_str.as_bytes());
-    let result = hasher.finalize();
-    hex::encode(&result[..8]) // 取前 8 字节 = 16 位 hex
-}
-
 /// 将路径的元数据填充到 FileNode 中。
-fn build_file_node(path: &Path, parent_id: Option<String>) -> FileNode {
+/// 接受可选的 `&fs::Metadata` 以复用 WalkDir 已缓存的 metadata。
+fn build_file_node(path: &Path, parent_id: Option<String>, meta: Option<&fs::Metadata>) -> FileNode {
     let is_directory = path.is_dir();
     let name = path
         .file_name()
@@ -267,35 +256,34 @@ fn build_file_node(path: &Path, parent_id: Option<String>) -> FileNode {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let ftype = classify_file_type(&ext);
-        (0, ext, ftype) // 文件大小稍后填充
+        (0, ext, ftype)
     };
 
-    let (actual_size, created_at, modified_at, accessed_at) =
-        match fs::metadata(path) {
-            Ok(meta) => {
-                let size_val = if is_directory { 0 } else { meta.len() };
-                let created = meta
-                    .created()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let accessed = meta
-                    .accessed()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                (size_val, created, modified, accessed)
-            }
-            Err(_) => (0, 0, 0, 0),
-        };
+    let (actual_size, created_at, modified_at, accessed_at) = match meta {
+        Some(m) => {
+            let size_val = if is_directory { 0 } else { m.len() };
+            let created = m
+                .created()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let modified = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let accessed = m
+                .accessed()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (size_val, created, modified, accessed)
+        }
+        None => (0, 0, 0, 0),
+    };
 
     FileNode {
         id,
@@ -314,35 +302,6 @@ fn build_file_node(path: &Path, parent_id: Option<String>) -> FileNode {
     }
 }
 
-/// 收集目录下的直接子项路径列表（仅一层）。
-fn collect_children(dir: &Path) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
-    let mut children = Vec::new();
-    let entries = fs::read_dir(dir)?;
-    for entry in entries {
-        match entry {
-            Ok(e) => {
-                let child_path = e.path();
-                // 排除符号链接
-                if e.file_type().map(|ft| ft.is_symlink()).unwrap_or(false) {
-                    continue;
-                }
-                children.push(child_path);
-            }
-            Err(_) => {
-                // 单个子项读取失败，跳过
-                continue;
-            }
-        }
-    }
-    // 按名称排序保证稳定输出
-    children.sort_by(|a, b| {
-        a.file_name()
-            .unwrap_or_default()
-            .cmp(b.file_name().unwrap_or_default())
-    });
-    Ok(children)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +315,14 @@ mod tests {
     #[test]
     fn test_classify_image() {
         assert_eq!(classify_file_type("png"), Some("IMAGE".into()));
+        assert_eq!(classify_file_type("psd"), Some("IMAGE".into()));
+    }
+
+    #[test]
+    fn test_classify_audio() {
+        assert_eq!(classify_file_type("mp3"), Some("AUDIO".into()));
+        assert_eq!(classify_file_type("wav"), Some("AUDIO".into()));
+        assert_eq!(classify_file_type("flac"), Some("AUDIO".into()));
     }
 
     #[test]
@@ -367,6 +334,8 @@ mod tests {
     #[test]
     fn test_classify_archive() {
         assert_eq!(classify_file_type("zip"), Some("ARCHIVE".into()));
+        assert_eq!(classify_file_type("apk"), Some("ARCHIVE".into()));
+        assert_eq!(classify_file_type("dmg"), Some("ARCHIVE".into()));
     }
 
     #[test]
@@ -388,10 +357,15 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_id_is_16_hex() {
+    fn test_generate_id_is_uuid_v5() {
         let id = generate_id("C:\\Users\\test\\file.txt");
-        assert_eq!(id.len(), 16);
-        // 应该全是 hex 字符
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
+        // 确定性
+        let id2 = generate_id("C:\\Users\\test\\file.txt");
+        assert_eq!(id, id2);
+        // 唯一性
+        let id3 = generate_id("C:\\Users\\test\\other.txt");
+        assert_ne!(id, id3);
     }
 }
