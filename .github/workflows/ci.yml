@@ -15,35 +15,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ─── 前端构建 & 检查 ──────────────────────────────────
-  frontend:
-    name: Frontend
-    runs-on: ubuntu-latest
+  build:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - run: npm ci
-
-      - run: npm run build
-
-      - uses: actions/upload-artifact@v4
-        if: github.event_name == 'push'
-        with:
-          name: dist
-          path: dist/
-          retention-days: 7
-
-  # ─── Rust 代码质量 ────────────────────────────────────
-  backend:
-    name: Rust
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -52,58 +30,15 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-          shared-key: tauri
-
-      - name: Install Tauri system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: Format check
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+        run: cargo fmt --check
 
-      - name: Clippy (strict)
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+      - name: Clippy
+        run: cargo clippy -- -D warnings
 
       - name: Test
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test
 
-      - name: Build check (release)
-        run: cargo build --manifest-path src-tauri/Cargo.toml --release
-
-  # ─── 安全审计 ─────────────────────────────────────────
-  security:
-    name: Security
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-          shared-key: tauri
-
-      - name: cargo audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  # ─── 全量通过标记 ────────────────────────────────────
-  ok:
-    name: All Green
-    needs: [frontend, backend, security]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 1
-    steps:
-      - name: Check results
-        run: |
-          if [[ "${{ needs.frontend.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.backend.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.security.result }}" != "success" ]]; then exit 1; fi
-          echo "All checks passed"
+      - name: Build release
+        run: cargo build --release

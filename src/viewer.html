@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>DiskPeek</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+#toolbar{display:flex;align-items:center;gap:12px;padding:8px 16px;background:#1e293b;border-bottom:1px solid #334155;flex-shrink:0}
+#toolbar h1{font-size:15px;font-weight:700;color:#818cf8;letter-spacing:.5px}
+#path-input{flex:1;padding:6px 12px;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:13px;outline:none}
+#path-input:focus{border-color:#818cf8}
+#scan-btn{padding:6px 16px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-size:13px;font-weight:600;cursor:pointer}
+#scan-btn:hover{background:#6d28d9}
+#scan-btn:disabled{opacity:.5;cursor:wait}
+#status{padding:6px 16px;background:#1e293b;border-bottom:1px solid #1e293b;font-size:12px;color:#94a3b8;flex-shrink:0}
+#breadcrumb{display:flex;align-items:center;padding:6px 16px;background:#1e293b;border-bottom:1px solid #334155;font-size:12px;gap:4px;flex-shrink:0;overflow-x:auto}
+.crumb{background:none;border:none;color:#94a3b8;cursor:pointer;padding:2px 6px;border-radius:3px;font-size:12px}
+.crumb:hover{background:#334155;color:#e2e8f0}
+.crumb.active{color:#e2e8f0;font-weight:600}
+.sep{color:#475569;font-size:10px}
+#chart{flex:1;position:relative;overflow:hidden}
+#chart svg{width:100%;height:100%}
+#tooltip{position:fixed;display:none;background:#1e293b;border:1px solid #475569;border-radius:6px;padding:8px 12px;font-size:12px;pointer-events:none;z-index:100;box-shadow:0 4px 12px rgba(0,0,0,.3)}
+#tooltip .tt-name{font-weight:600;margin-bottom:2px;color:#f1f5f9}
+#tooltip .tt-size{color:#94a3b8}
+#tooltip .tt-pct{color:#818cf8}
+#loading{display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#818cf8;font-size:14px}
+</style>
+</head>
+<body>
+<div id="toolbar">
+<h1>DiskPeek</h1>
+<input id="path-input" placeholder="Directory path (leave empty for home)">
+<button id="scan-btn">Scan</button>
+</div>
+<div id="status"></div>
+<div id="breadcrumb"></div>
+<div id="chart">
+<div id="loading">Scanning...</div>
+</div>
+<div id="tooltip">
+<div class="tt-name"></div>
+<div class="tt-size"></div>
+<div class="tt-pct"></div>
+</div>
+<script>
+let currentNodes=[];
+let currentRoot=null;
+let breadcrumbStack=[];
+let totalSize=0;
+const colors={VIDEO:'#3b82f6',IMAGE:'#10b981',AUDIO:'#ec4899',DOCUMENT:'#f59e0b',ARCHIVE:'#8b5cf6',OTHER:'#6b7280'};
+const dirColor='#4f46e5';
+const chart=document.getElementById('chart');
+const tooltip=document.getElementById('tooltip');
+const status=document.getElementById('status');
+const breadcrumb=document.getElementById('breadcrumb');
+const scanBtn=document.getElementById('scan-btn');
+const pathInput=document.getElementById('path-input');
+const loading=document.getElementById('loading');
+scanBtn.onclick=()=>doScan();
+pathInput.onkeydown=e=>{if(e.key==='Enter')doScan()};
+function doScan(){
+scanBtn.disabled=true;
+scanBtn.textContent='Scanning...';
+loading.style.display='block';
+status.textContent='Scanning...';
+const p=pathInput.value.trim();
+fetch('/api/scan'+(p?'?path='+encodeURIComponent(p):''))
+.then(r=>r.json())
+.then(data=>{
+currentNodes=data.nodes;
+totalSize=data.totalSize;
+breadcrumbStack=[];
+currentRoot=null;
+status.textContent=`${data.nodeCount} items, ${fmtSize(data.totalSize)}`;
+renderBreadcrumb();
+render();
+}).catch(e=>{
+status.textContent='Error: '+e.message;
+}).finally(()=>{
+scanBtn.disabled=false;
+scanBtn.textContent='Scan';
+loading.style.display='none';
+});
+}
+function renderBreadcrumb(){
+breadcrumb.innerHTML='';
+const allBtn=document.createElement('button');
+allBtn.className='crumb'+(currentRoot===null?' active':'');
+allBtn.textContent='All';
+allBtn.onclick=()=>{currentRoot=null;breadcrumbStack=[];renderBreadcrumb();render()};
+breadcrumb.appendChild(allBtn);
+breadcrumbStack.forEach((node,i)=>{
+const s=document.createElement('span');
+s.className='sep';s.textContent='>';breadcrumb.appendChild(s);
+const b=document.createElement('button');
+b.className='crumb'+(i===breadcrumbStack.length-1?' active':'');
+b.textContent=node.name;
+b.onclick=()=>{currentRoot=node;breadcrumbStack=breadcrumbStack.slice(0,i+1);renderBreadcrumb();render()};
+breadcrumb.appendChild(b);
+});
+}
+function render(){
+const root=currentRoot?currentRoot.children:currentNodes;
+if(!root||root.length===0){d3.select('#chart').selectAll('svg').remove();return}
+const w=chart.clientWidth;const h=chart.clientHeight;
+if(w<=0||h<=0)return;
+const flat=flatten(root).sort((a,b)=>b.size-a.size);
+const hierarchy=d3.hierarchy({name:'root',children:flat,size:0,isDir:true,fileType:'OTHER',modifiedAt:0,path:''}).sum(d=>d.isDir?0:d.size).sort((a,b)=>b.value-a.value);
+d3.treemap().size([w,h]).paddingOuter(3).paddingInner(2).round(true)(hierarchy);
+const leaves=hierarchy.leaves();
+const svg=d3.select('#chart').selectAll('svg').data([null]);
+const svgEnter=svg.enter().append('svg');
+const svgMerged=svgEnter.merge(svg).attr('width',w).attr('height',h);
+svgMerged.selectAll('g').remove();
+const g=svgMerged.append('g');
+const cells=g.selectAll('g.cell').data(leaves,d=>d.data.path).join(enter=>{
+const eg=enter.append('g').attr('class','cell').attr('opacity',0);
+eg.append('rect');
+eg.append('text').attr('fill','#fff').attr('pointer-events','none');
+eg.transition().duration(400).attr('opacity',1);
+return eg;
+});
+cells.select('rect')
+.attr('x',d=>d.x0).attr('y',d=>d.y0)
+.attr('width',d=>Math.max(0,d.x1-d.x0))
+.attr('height',d=>Math.max(0,d.y1-d.y0))
+.attr('rx',2)
+.attr('fill',d=>d.data.isDir?dirColor:(colors[d.data.fileType]||colors.OTHER))
+.attr('stroke','#0f172a').attr('stroke-width',1);
+cells.select('text')
+.attr('x',d=>d.x0+4).attr('y',d=>d.y0+14)
+.attr('font-size',d=>{
+const area=(d.x1-d.x0)*(d.y1-d.y0);
+return Math.min(12,Math.max(8,Math.sqrt(area)/7));
+})
+.text(d=>{
+const area=(d.x1-d.x0)*(d.y1-d.y0);
+if(area<400)return'';
+const name=d.data.name;
+return name.length>20?name.slice(0,18)+'..':name;
+});
+cells.on('mouseenter',function(ev,d){
+const pct=((d.value/totalSize)*100).toFixed(1);
+tooltip.querySelector('.tt-name').textContent=d.data.name;
+tooltip.querySelector('.tt-size').textContent=fmtSize(d.value);
+tooltip.querySelector('.tt-pct').textContent=pct+'%';
+tooltip.style.display='block';
+tooltip.style.left=ev.clientX+12+'px';
+tooltip.style.top=ev.clientY-10+'px';
+}).on('mousemove',function(ev){
+tooltip.style.left=ev.clientX+12+'px';
+tooltip.style.top=ev.clientY-10+'px';
+}).on('mouseleave',()=>tooltip.style.display='none')
+.on('click',(ev,d)=>{
+if(d.data.isDir&&d.data.children&&d.data.children.length>0){
+breadcrumbStack.push(d.data);
+currentRoot=d.data;
+renderBreadcrumb();
+render();
+}
+});
+}
+function flatten(nodes){
+const r=[];
+for(const n of nodes){
+if(n.isDir&&n.children&&n.children.length>0){
+r.push(...flatten(n.children));
+}else{
+r.push(n);
+}
+}
+return r;
+}
+function fmtSize(b){
+if(b===0)return'0 B';
+const u=['B','KB','MB','GB','TB'];
+const i=Math.min(Math.floor(Math.log(b)/Math.log(1024)),u.length-1);
+return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i];
+}
+new ResizeObserver(()=>render()).observe(chart);
+</script>
+</body>
+</html>
