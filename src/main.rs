@@ -51,9 +51,8 @@ fn html_response(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 }
 
 fn json_response(body: String) -> Response<std::io::Cursor<Vec<u8>>> {
-    Response::from_string(body).with_header(
-        Header::from_bytes("Content-Type", "application/json").unwrap(),
-    )
+    Response::from_string(body)
+        .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
 }
 
 fn not_found() -> Response<std::io::Cursor<Vec<u8>>> {
@@ -189,8 +188,8 @@ fn count_nodes(nodes: &[FileNode]) -> usize {
 
 fn classify(ext: &str) -> &'static str {
     match ext {
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg"
-        | "3gp" | "rmvb" | "ts" => "VIDEO",
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg" | "3gp"
+        | "rmvb" | "ts" => "VIDEO",
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tiff" | "tif"
         | "heic" | "raw" | "cr2" | "nef" | "psd" => "IMAGE",
         "mp3" | "wav" | "flac" | "aac" | "ogg" | "wma" | "m4a" | "opus" => "AUDIO",
