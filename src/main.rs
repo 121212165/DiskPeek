@@ -117,7 +117,7 @@ fn scan_dir(root: &str, max_depth: usize) -> Vec<FileNode> {
         if entry.file_type().is_symlink() {
             continue;
         }
-        while stack.last().map_or(false, |(_, _, _, d)| *d >= depth) {
+        while stack.last().is_some_and(|(_, _, _, d)| *d >= depth) {
             let (_, mut dir_node, children, _) = stack.pop().unwrap();
             dir_node.children = children;
             if let Some(top) = stack.last_mut() {

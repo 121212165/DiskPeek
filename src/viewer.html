@@ -15,6 +15,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 #scan-btn{padding:6px 16px;border:none;border-radius:6px;background:#7c3aed;color:#fff;font-size:13px;font-weight:600;cursor:pointer}
 #scan-btn:hover{background:#6d28d9}
 #scan-btn:disabled{opacity:.5;cursor:wait}
+.view-switcher{display:flex;gap:4px}
+.view-btn{width:32px;height:32px;border:none;border-radius:6px;background:transparent;color:#94a3b8;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s,color .15s}
+.view-btn:hover{background:rgba(255,255,255,.1)}
+.view-btn.active{background:#7c3aed;color:#fff}
 #status{padding:6px 16px;background:#1e293b;border-bottom:1px solid #1e293b;font-size:12px;color:#94a3b8;flex-shrink:0}
 #breadcrumb{display:flex;align-items:center;padding:6px 16px;background:#1e293b;border-bottom:1px solid #334155;font-size:12px;gap:4px;flex-shrink:0;overflow-x:auto}
 .crumb{background:none;border:none;color:#94a3b8;cursor:pointer;padding:2px 6px;border-radius:3px;font-size:12px}
@@ -35,6 +39,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <h1>DiskPeek</h1>
 <input id="path-input" placeholder="Directory path (leave empty for home)">
 <button id="scan-btn">Scan</button>
+<div class="view-switcher">
+<button class="view-btn active" data-view="treemap" title="Treemap">▦</button>
+<button class="view-btn" data-view="sunburst" title="Sunburst">◎</button>
+</div>
 </div>
 <div id="status"></div>
 <div id="breadcrumb"></div>
@@ -51,6 +59,7 @@ let currentNodes=[];
 let currentRoot=null;
 let breadcrumbStack=[];
 let totalSize=0;
+let viewMode='treemap';
 const colors={VIDEO:'#3b82f6',IMAGE:'#10b981',AUDIO:'#ec4899',DOCUMENT:'#f59e0b',ARCHIVE:'#8b5cf6',OTHER:'#6b7280'};
 const dirColor='#4f46e5';
 const chart=document.getElementById('chart');
@@ -62,6 +71,17 @@ const pathInput=document.getElementById('path-input');
 const loading=document.getElementById('loading');
 scanBtn.onclick=()=>doScan();
 pathInput.onkeydown=e=>{if(e.key==='Enter')doScan()};
+
+// View switcher
+document.querySelectorAll('.view-btn').forEach(btn=>{
+btn.onclick=()=>{
+document.querySelector('.view-btn.active').classList.remove('active');
+btn.classList.add('active');
+viewMode=btn.dataset.view;
+render();
+};
+});
+
 function doScan(){
 scanBtn.disabled=true;
 scanBtn.textContent='Scanning...';
@@ -104,6 +124,17 @@ breadcrumb.appendChild(b);
 });
 }
 function render(){
+if(viewMode==='sunburst'){renderSunburst()}else{renderTreemap()}
+}
+
+function prepareHierarchy(){
+const root=currentRoot?currentRoot.children:currentNodes;
+if(!root||root.length===0)return null;
+const flat=flatten(root).sort((a,b)=>b.size-a.size);
+return d3.hierarchy({name:'root',children:flat,size:0,isDir:true,fileType:'OTHER',modifiedAt:0,path:''}).sum(d=>d.isDir?0:d.size).sort((a,b)=>b.value-a.value);
+}
+
+function renderTreemap(){
 const root=currentRoot?currentRoot.children:currentNodes;
 if(!root||root.length===0){d3.select('#chart').selectAll('svg').remove();return}
 const w=chart.clientWidth;const h=chart.clientHeight;
@@ -144,16 +175,9 @@ const name=d.data.name;
 return name.length>20?name.slice(0,18)+'..':name;
 });
 cells.on('mouseenter',function(ev,d){
-const pct=((d.value/totalSize)*100).toFixed(1);
-tooltip.querySelector('.tt-name').textContent=d.data.name;
-tooltip.querySelector('.tt-size').textContent=fmtSize(d.value);
-tooltip.querySelector('.tt-pct').textContent=pct+'%';
-tooltip.style.display='block';
-tooltip.style.left=ev.clientX+12+'px';
-tooltip.style.top=ev.clientY-10+'px';
+showTooltip(ev,d.data.name,d.value,d);
 }).on('mousemove',function(ev){
-tooltip.style.left=ev.clientX+12+'px';
-tooltip.style.top=ev.clientY-10+'px';
+moveTooltip(ev);
 }).on('mouseleave',()=>tooltip.style.display='none')
 .on('click',(ev,d)=>{
 if(d.data.isDir&&d.data.children&&d.data.children.length>0){
@@ -164,6 +188,100 @@ render();
 }
 });
 }
+
+function renderSunburst(){
+const hierarchy=prepareHierarchy();
+if(!hierarchy){d3.select('#chart').selectAll('svg').remove();return}
+const w=chart.clientWidth;const h=chart.clientHeight;
+if(w<=0||h<=0)return;
+const radius=Math.min(w,h)/2;
+const totalValue=hierarchy.value||1;
+const hDepth=hierarchy.height;
+
+d3.partition().size([2*Math.PI,radius])(hierarchy);
+
+const arcGen=d3.arc()
+.startAngle(d=>d.x0)
+.endAngle(d=>d.x1)
+.innerRadius(d=>(d.depth/(hDepth+1))*radius)
+.outerRadius(d=>((d.depth+1)/(hDepth+1))*radius);
+
+const svg=d3.select('#chart').selectAll('svg').data([null]);
+const svgEnter=svg.enter().append('svg');
+const svgMerged=svgEnter.merge(svg).attr('width',w).attr('height',h);
+svgMerged.selectAll('g').remove();
+const g=svgMerged.append('g').attr('transform','translate('+w/2+','+h/2+')');
+
+const arcs=hierarchy.descendants().filter(d=>d.depth>0);
+
+const path=g.selectAll('path').data(arcs,d=>d.data.path).join(enter=>{
+const ep=enter.append('path')
+.attr('opacity',0)
+.attr('stroke','#0f172a').attr('stroke-width',1);
+ep.transition().duration(400).attr('opacity',0.9);
+return ep;
+});
+path.attr('fill',d=>d.data.isDir?dirColor:(colors[d.data.fileType]||colors.OTHER))
+.attr('d',d=>arcGen(d));
+
+path.on('mouseenter',function(ev,d){
+showTooltip(ev,d.data.name,d.value,d);
+}).on('mousemove',function(ev){
+moveTooltip(ev);
+}).on('mouseleave',()=>tooltip.style.display='none')
+.on('click',(ev,d)=>{
+if(d.data.isDir&&d.data.children&&d.data.children.length>0){
+breadcrumbStack.push(d.data);
+currentRoot=d.data;
+renderBreadcrumb();
+render();
+}
+});
+
+// Labels on arcs with sufficient angular span
+g.selectAll('text.label').remove();
+path.each(function(d){
+const arcLen=d.x1-d.x0;
+if(arcLen<0.15)return;
+const midAngle=(d.x0+d.x1)/2;
+const labelRadius=((d.depth+0.65)/(hDepth+1))*radius;
+const x=Math.sin(midAngle)*labelRadius;
+const y=-Math.cos(midAngle)*labelRadius;
+const name=d.data.name;
+const textEl=g.append('text').attr('class','label')
+.attr('x',x).attr('y',y)
+.attr('fill','#fff')
+.attr('font-size',Math.min(12,Math.max(8,(arcLen*radius)/12)))
+.attr('text-anchor','middle')
+.attr('dominant-baseline','middle')
+.attr('pointer-events','none')
+.text(name.length>12?name.slice(0,10)+'..':name);
+const angleDeg=midAngle*180/Math.PI-90;
+textEl.attr('transform','rotate('+angleDeg+','+x+','+y+')');
+});
+
+// Center label
+const rootName=hierarchy.data.name;
+g.append('text')
+.attr('text-anchor','middle').attr('dy','0.35em')
+.attr('fill','#e2e8f0').attr('font-size',13).attr('font-weight',600)
+.attr('pointer-events','none')
+.text(rootName.length>10?rootName.slice(0,8)+'..':rootName);
+}
+
+function showTooltip(ev,name,size,d){
+const pct=d&&d.value!=null?((d.value/totalSize)*100).toFixed(1):'0.0';
+tooltip.querySelector('.tt-name').textContent=name;
+tooltip.querySelector('.tt-size').textContent=fmtSize(size);
+tooltip.querySelector('.tt-pct').textContent=pct+'%';
+tooltip.style.display='block';
+moveTooltip(ev);
+}
+function moveTooltip(ev){
+tooltip.style.left=ev.clientX+12+'px';
+tooltip.style.top=ev.clientY-10+'px';
+}
+
 function flatten(nodes){
 const r=[];
 for(const n of nodes){
